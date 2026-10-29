@@ -1,84 +1,131 @@
 #include <stdio.h>
-#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+#include <unistd.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
-#include <unistd.h>
 #include <linux/if_ether.h>
 #include <linux/if_packet.h>
 #include <net/if.h>
-#include <sys/ioctl.h>
-#include <string.h>
-
-// Helper function to print a single byte in 8-bit binary format
-void print_binary_byte(unsigned char byte) {
-    for (int i = 7; i >= 0; i--) {
-        printf("%d", (byte >> i) & 1);
+#include <netinet/ip.h>
+#include <netinet/ip6.h>
+#include <netinet/udp.h>
+static void print_banner(void) {
+    static const char *art[] = {
+        " ____  _   _ ____",
+        "|  _ \\| \\ | / ___|",
+        "| | | |  \\| \\___ \\",
+        "| |_| | |\\  |___) |",
+        "|____/|_| \\_|____/",
+        "   s n i f f e r",
+        "",
+        "  [you] ==[ A? www.youtube.com ]==>>> (the internet)",
+        "  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~",
+        "        watching UDP port 53 on every interface",
+        "",
+    };
+    for (size_t i = 0; i < sizeof(art) / sizeof(art[0]); i++)
+        puts(art[i]);
+}
+static const char *type_name(uint16_t t) {
+    switch (t) {
+        case 1:  return "IPv4 / A";
+        case 28: return "IPv6 / AAAA";
+        case 5:  return "CNAME";
+        case 15: return "MX";
+        case 16: return "TXT";
+        case 65: return "HTTPS";
+        default: return "?";
     }
 }
 
-int main() {
-    int amount_of_packages = 0;
+
+static void handle_dns(const unsigned char *dns, size_t len, const char *ifname) {
+    if (len < 12) return;
+
+    uint16_t flags = (dns[2] << 8) | dns[3];
+    if (flags & 0x8000) return;
+    uint16_t questions = (dns[4] << 8) | dns[5];
+    if (questions < 1) return;
+
+    char name[256];
+    size_t n = 0, pos = 12;
+    int terminated = 0;
+
+    while (pos < len) {
+        unsigned char label_len = dns[pos++];
+        if (label_len == 0) { terminated = 1; break; }
+        if (label_len & 0xC0) return;
+        if (pos + label_len > len || n + label_len + 1 >= sizeof(name)) return;
+        memcpy(name + n, dns + pos, label_len);
+        n += label_len;
+        name[n++] = '.';
+        pos += label_len;
+    }
+    if (!terminated || pos + 4 > len) return;
+
+    if (n > 0) n--;
+    name[n] = '\0';
+
+    uint16_t qtype = (dns[pos] << 8) | dns[pos + 1];
+    printf("[%s] %-12s %s\n", ifname, type_name(qtype), n ? name : ".");
+}
+
+int main(void) {
+    print_banner();
     int sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
     if (sock < 0) {
-        perror("Socket creation failed. Use sudo");
+        perror("socket (try sudo)");
         return 1;
     }
-
-    // --- Bind specifically to wlp10s0 ---
-    struct sockaddr_ll sll;
-    struct ifreq ifr;
-
-    // Safely copy the interface name into the ifreq structure
-    snprintf(ifr.ifr_name, IFNAMSIZ, "wlp10s0");
-
-    // Get the interface index mapping for wlp10s0
-    if (ioctl(sock, SIOCGIFINDEX, &ifr) < 0) {
-        perror("Failed to get interface index. Is wlp10s0 up?");
-        close(sock);
-        return 1;
-    }
-
-    // Set up socket address structure for binding
-    memset(&sll, 0, sizeof(sll));
-    sll.sll_family = AF_PACKET;
-    sll.sll_ifindex = ifr.ifr_ifindex;
-    sll.sll_protocol = htons(ETH_P_ALL);
-
-    if (bind(sock, (struct sockaddr *)&sll, sizeof(sll)) < 0) {
-        perror("Bind to wlp10s0 failed");
-        close(sock);
-        return 1;
-    }
-    // ----------------------------------------
 
     unsigned char buffer[2048];
-    printf("Listening for packets on wlp10s0... Press Ctrl+C to stop.\n\n");
+    printf("Watching DNS queries on all interfaces (Ctrl+C to stop)...\n\n");
 
-    printf("How many packages to recieve (ans*10) ?");
-    if (fgets(buffer, sizeof(buffer), stdin)) {
-        amount_of_packages = atoi(buffer)*10;
-    }
-    ssize_t packet_size = recvfrom(sock, buffer, sizeof(buffer), 0, NULL, NULL);
-    if (packet_size < 0) {
-        perror("Recvfrom failed");
-        close(sock);
-        return 1;
-    }
+    while (1) {
+        struct sockaddr_ll from;
+        socklen_t fromlen = sizeof(from);
+        ssize_t size = recvfrom(sock, buffer, sizeof(buffer), 0,
+                                (struct sockaddr *)&from, &fromlen);
+        if (size < 0) {
+            perror("recvfrom");
+            break;
+        }
 
-    printf("packet captured (%ld bytes)\n", packet_size);
+        // only outgoing
+        if (from.sll_pkttype != PACKET_OUTGOING) continue;
 
-    int bytes_to_print = (packet_size > amount_of_packages) ? amount_of_packages : packet_size;
-    printf("Byte Offset | Hex  | Binary\n");
-    printf("------------|------|-----------------\n");
+        char ifname[IF_NAMESIZE] = "?";
+        if_indextoname(from.sll_ifindex, ifname);
 
-    for (int i = 0; i < bytes_to_print; i++) {
-        printf("Byte [%02d]   | 0x%02X | ", i, buffer[i]);
-        print_binary_byte(buffer[i]);
+        if (size < (ssize_t)sizeof(struct ethhdr)) continue;
+        struct ethhdr *eth = (struct ethhdr *)buffer;
+        uint16_t ethertype = ntohs(eth->h_proto);
+        size_t offset = sizeof(struct ethhdr);
 
-        if (i == 5)  printf(" <-- destination MAC ends");
-        if (i == 11) printf(" <-- source MAC ends");
-        if (i == 13) printf(" <-- Ethernet type");
-        printf("\n");
+        // locate UDP starting
+        if (ethertype == ETH_P_IP) {
+            if (size < (ssize_t)(offset + sizeof(struct iphdr))) continue;
+            struct iphdr *ip = (struct iphdr *)(buffer + offset);
+            if (ip->protocol != IPPROTO_UDP || ip->ihl < 5) continue;
+            offset += ip->ihl * 4;
+        } else if (ethertype == ETH_P_IPV6) {
+            if (size < (ssize_t)(offset + sizeof(struct ip6_hdr))) continue;
+            struct ip6_hdr *ip6 = (struct ip6_hdr *)(buffer + offset);
+            if (ip6->ip6_nxt != IPPROTO_UDP) continue;
+            offset += sizeof(struct ip6_hdr);
+        } else {
+            continue;
+        }
+
+        // layer 4 UDP
+        if ((size_t)size < offset + sizeof(struct udphdr)) continue;
+        struct udphdr *udp = (struct udphdr *)(buffer + offset);
+        if (ntohs(udp->uh_dport) != 53) continue;
+        offset += sizeof(struct udphdr);
+
+        // layer 7 dns
+        handle_dns(buffer + offset, (size_t)size - offset, ifname);
     }
 
     close(sock);
